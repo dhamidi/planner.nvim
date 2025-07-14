@@ -1,5 +1,15 @@
 local M = {}
 
+-- Default configuration
+local default_config = {
+  custom_instructions = "",
+  log_path = vim.fn.expand("~/.local/state/nvim/planner.log"),
+  response_path = vim.fn.expand("~/.local/tmp/planner.txt"),
+}
+
+-- Store the merged configuration
+local config = {}
+
 -- Store active processes
 local active_processes = {}
 
@@ -12,34 +22,40 @@ local spinner_index = 1
 
 -- Prepare input for subprocess
 local function prepare_llm_prompt(file_contents, selected_text)
-  return string.format(
-    [[You are the technical planner, operating on a markdown file.
-
-The user has asked you to break down a step of the plan.
+  local prompt = "You are the technical planner, operating on a markdown file.\n\n"
+  
+  -- Add custom instructions if provided
+  if config.custom_instructions and config.custom_instructions ~= "" then
+    prompt = prompt .. config.custom_instructions .. "\n\n"
+  end
+  
+  prompt = prompt .. string.format(
+    [[The user has asked you to break down a step of the plan.
 
 Inspect the entire plan, and then take the selected step and break it down into more detailed steps.
 
 Respond only with the more detailed version of selected_text.  Your response will replace selected_text
-in the original plan. You MUST write your response to ~/.planner.response
+in the original plan. You MUST write your response to %s
 
 If selected_text contains the word "study", actually perform the research and include the results in your response.
 
 <plan_file>%s</plan_file>
 <selected_text>%s</selected_text>
   ]],
+    config.response_path,
     file_contents,
     selected_text
   )
+  
+  return prompt
 end
 
 -- Logging function
 local function log(msg)
-  local home = os.getenv("HOME") or os.getenv("USERPROFILE") or "."
-  local log_file = home .. "/.planner.log"
   local timestamp = os.date("%Y-%m-%d %H:%M:%S")
   local log_entry = string.format("[%s] %s\n", timestamp, msg)
 
-  local file = io.open(log_file, "a")
+  local file = io.open(config.log_path, "a")
   if file then
     file:write(log_entry)
     file:close()
@@ -121,10 +137,11 @@ function M.process_selected_text()
 
   -- Spawn the process
   local stdin_pipe = vim.loop.new_pipe(false)
+  local stdout_pipe = vim.loop.new_pipe(false)
 
   local handle, pid = vim.loop.spawn("amp", {
     args = {},
-    stdio = { stdin_pipe, nil, nil },
+    stdio = { stdin_pipe, stdout_pipe, nil },
   })
 
   if not handle then
@@ -137,13 +154,16 @@ function M.process_selected_text()
   -- Store process info immediately
   active_processes[pid] = {
     bufnr = vim.api.nvim_get_current_buf(),
-    start_time = vim.loop.now(),
+    start_time = vim.loop.hrtime(),
     timer = vim.loop.new_timer(),
     handle = handle,
+    stdout_pipe = stdout_pipe,
     extmark_id = nil,
     selection_start = {start_line, start_col},
     selection_end = {end_line, end_col},
     selected_text = selected_text,
+    output_buffer = "",
+    last_output = "",
   }
 
   -- Set up completion callback with captured pid
@@ -152,9 +172,7 @@ function M.process_selected_text()
       log(string.format("Process %s finished with code %s", tostring(pid), tostring(code)))
 
       -- Read response from file
-      local home = os.getenv("HOME") or os.getenv("USERPROFILE") or "."
-      local response_file = home .. "/.planner.response"
-      local file = io.open(response_file, "r")
+      local file = io.open(config.response_path, "r")
       local response_content = ""
 
       if file then
@@ -202,6 +220,9 @@ function M.process_selected_text()
           process_info.timer:stop()
           process_info.timer:close()
         end
+        if process_info.stdout_pipe then
+          process_info.stdout_pipe:close()
+        end
         active_processes[pid] = nil
       else
         log("No process info found for PID " .. tostring(pid))
@@ -226,6 +247,31 @@ function M.process_selected_text()
       check_timer:stop()
       check_timer:close()
       completion_callback(exit_code or 0, signal or 0)
+    end
+  end)
+
+  -- Start reading stdout
+  stdout_pipe:read_start(function(err, data)
+    if err then
+      log("Error reading stdout: " .. err)
+    elseif data then
+      vim.schedule(function()
+        local process_info = active_processes[pid]
+        if process_info then
+          process_info.output_buffer = process_info.output_buffer .. data
+          
+          -- Extract last 20 characters, trim whitespace
+          local trimmed = process_info.output_buffer:gsub("^%s*(.-)%s*$", "%1")
+          if #trimmed > 20 then
+            process_info.last_output = "..." .. string.sub(trimmed, -17)
+          else
+            process_info.last_output = trimmed
+          end
+          
+          log(string.format("Stdout data: '%s'", data))
+          log(string.format("Last output: '%s'", process_info.last_output))
+        end
+      end)
     end
   end)
 
@@ -264,14 +310,22 @@ function M.process_selected_text()
         return
       end
 
-      local elapsed = math.floor((vim.loop.now() - process_info.start_time) / 1000)
+      local elapsed = (vim.loop.hrtime() - process_info.start_time) / 1e9
       
       -- Update spinner animation
       spinner_index = (spinner_index % #spinner_frames) + 1
       local spinner = spinner_frames[spinner_index]
       
-      -- Update virtual text with spinner and elapsed time
-      local new_text = string.format(" %s Processing... %ds", spinner, elapsed)
+      -- Format elapsed time
+      local time_str = string.format("%.1fs", elapsed)
+      
+      -- Build display text with spinner, time, and output preview
+      local display_text = string.format(" %s Processing (%s)", spinner, time_str)
+      if process_info.last_output ~= "" then
+        display_text = display_text .. " " .. process_info.last_output
+      end
+      
+      local new_text = display_text
       
       -- Update the extmark with new virtual text
       if process_info.extmark_id then
@@ -348,6 +402,11 @@ function M.abort_process()
       process_info.timer:close()
     end
     
+    -- Close stdout pipe
+    if process_info.stdout_pipe then
+      process_info.stdout_pipe:close()
+    end
+    
     -- Remove from active processes
     active_processes[pid] = nil
     
@@ -361,6 +420,36 @@ end
 
 function M.setup(opts)
   opts = opts or {}
+  
+  -- Merge configuration
+  config = vim.tbl_deep_extend("force", default_config, opts)
+  
+  -- Validate configuration
+  if type(config.custom_instructions) ~= "string" then
+    error("planner.nvim: custom_instructions must be a string")
+  end
+  
+  if type(config.log_path) ~= "string" or config.log_path == "" then
+    error("planner.nvim: log_path must be a non-empty string")
+  end
+  
+  if type(config.response_path) ~= "string" or config.response_path == "" then
+    error("planner.nvim: response_path must be a non-empty string")
+  end
+
+  -- Create directory structure for configurable paths
+  local log_dir = vim.fn.fnamemodify(config.log_path, ":h")
+  local response_dir = vim.fn.fnamemodify(config.response_path, ":h")
+  
+  local success = vim.fn.mkdir(log_dir, "p")
+  if success == 0 then
+    error("planner.nvim: Failed to create log directory: " .. log_dir)
+  end
+  
+  success = vim.fn.mkdir(response_dir, "p")
+  if success == 0 then
+    error("planner.nvim: Failed to create response directory: " .. response_dir)
+  end
 
   -- Set up default key mapping
   vim.keymap.set("v", "<leader>pp", M.process_selected_text, {

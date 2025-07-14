@@ -75,7 +75,7 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
    c. Test cursor positioning edge cases (before/after virtual text)
    d. Ensure abort works with multiple concurrent processes
 
-### Showing process output preview
+### Showing process output preview - DONE
 
 1. Set up stdout monitoring for the amp process
    a. Modify `vim.loop.spawn()` call to include stdout pipe setup
@@ -125,3 +125,55 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
    b. Test with various output patterns (short, long, special chars)
    c. Ensure timer updates smoothly with spinner + time + output
    d. Test edge cases: no output, binary output, very fast output
+
+### Add configuration settings
+
+1. Define default configuration structure
+   a. Create `default_config` table with all configurable options
+   b. Set `custom_instructions = ""` for injectable prompt text
+   c. Set `log_path = vim.fn.expand("~/.local/state/nvim/planner.log")` with proper path expansion
+   d. Set `response_path = vim.fn.expand("~/.local/tmp/planner.txt")` with proper path expansion
+   e. Add validation for required directory creation
+
+2. Implement configuration merging in setup function
+   a. Accept `opts` parameter in `M.setup(opts)` function
+   b. Use `vim.tbl_deep_extend("force", default_config, opts or {})` to merge configs
+   c. Store merged config in module-level variable for global access
+   d. Validate configuration options and provide helpful error messages
+
+3. Create directory structure for configurable paths
+   a. Extract directory from log_path: `vim.fn.fnamemodify(config.log_path, ":h")`
+   b. Create directories if they don't exist: `vim.fn.mkdir(dir, "p")`
+   c. Handle permission errors and provide fallback paths
+   d. Apply same logic for response_path directory creation
+
+4. Integrate custom instructions into LLM prompt
+   a. Modify `process_selected_text()` to include custom instructions
+   b. Prepend `config.custom_instructions` to the prompt before plan file content
+   c. Add newline separation between custom instructions and plan content
+   d. Handle empty custom instructions gracefully (skip if empty)
+
+5. Update file I/O operations to use configurable paths
+   a. Replace hardcoded `~/.planner.log` with `config.log_path` in logging functions
+   b. Replace hardcoded `~/.planner.response` with `config.response_path` in process output
+   c. Update all file operations to use configured paths consistently
+   d. Ensure proper path expansion and error handling
+
+6. Add configuration validation and error handling
+   a. Validate that custom_instructions is a string
+   b. Validate that log_path and response_path are valid file paths
+   c. Check write permissions for configured directories
+   d. Provide meaningful error messages for invalid configurations
+
+7. Document configuration options
+   a. Add configuration examples to plugin documentation
+   b. Show how to set custom instructions for different use cases
+   c. Explain path configuration and default locations
+   d. Provide troubleshooting guidance for common configuration issues
+
+8. Test configuration functionality
+   a. Test setup with default configuration (no opts provided)
+   b. Test with partial configuration override (only some options)
+   c. Test with full configuration override (all options specified)
+   d. Verify custom instructions appear in LLM prompts correctly
+   e. Test file operations use configured paths properly
