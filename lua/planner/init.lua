@@ -50,6 +50,29 @@ If selected_text contains the word "study", actually perform the research and in
   return prompt
 end
 
+-- Generate preview text from stdout data
+local function generate_preview(data)
+  -- Remove unicode box drawing characters (U+2500-U+257F)
+  local cleaned = data:gsub("[\u{2500}-\u{257F}]", "")
+  
+  -- Split into lines and remove empty lines
+  local lines = {}
+  for line in cleaned:gmatch("[^\r\n]+") do
+    local trimmed = line:gsub("^%s*(.-)%s*$", "%1")
+    if trimmed ~= "" then
+      table.insert(lines, trimmed)
+    end
+  end
+  
+  -- Join lines with spaces and get last 20 characters
+  local text = table.concat(lines, " ")
+  if #text > 20 then
+    return string.sub(text, -20)
+  else
+    return text
+  end
+end
+
 -- Logging function
 local function log(msg)
   local timestamp = os.date("%Y-%m-%d %H:%M:%S")
@@ -162,7 +185,6 @@ function M.process_selected_text()
     selection_start = {start_line, start_col},
     selection_end = {end_line, end_col},
     selected_text = selected_text,
-    output_buffer = "",
     last_output = "",
   }
 
@@ -258,15 +280,7 @@ function M.process_selected_text()
       vim.schedule(function()
         local process_info = active_processes[pid]
         if process_info then
-          process_info.output_buffer = process_info.output_buffer .. data
-          
-          -- Extract last 20 characters, trim whitespace
-          local trimmed = process_info.output_buffer:gsub("^%s*(.-)%s*$", "%1")
-          if #trimmed > 20 then
-            process_info.last_output = "..." .. string.sub(trimmed, -17)
-          else
-            process_info.last_output = trimmed
-          end
+          process_info.last_output = generate_preview(data)
           
           log(string.format("Stdout data: '%s'", data))
           log(string.format("Last output: '%s'", process_info.last_output))
@@ -322,7 +336,12 @@ function M.process_selected_text()
       -- Build display text with spinner, time, and output preview
       local display_text = string.format(" %s Processing (%s)", spinner, time_str)
       if process_info.last_output ~= "" then
-        display_text = display_text .. " " .. process_info.last_output
+        -- Add ellipsis if the preview was truncated (20 chars is the max from generate_preview)
+        local preview = process_info.last_output
+        if #preview == 20 then
+          preview = "..." .. preview
+        end
+        display_text = display_text .. " " .. preview
       end
       
       local new_text = display_text

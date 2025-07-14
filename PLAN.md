@@ -126,7 +126,7 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
    c. Ensure timer updates smoothly with spinner + time + output
    d. Test edge cases: no output, binary output, very fast output
 
-### Add configuration settings
+### Add configuration settings - DONE
 
 1. Define default configuration structure
    a. Create `default_config` table with all configurable options
@@ -177,3 +177,9 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
    c. Test with full configuration override (all options specified)
    d. Verify custom instructions appear in LLM prompts correctly
    e. Test file operations use configured paths properly
+
+### Extract operation: Research
+
+The research operation takes the selected text in the context of the given plan and performs detailed technical research: identifying which files will need to change and summarizing the change that needs to be performed in each file.
+
+It should be available under `<leader> p r`
