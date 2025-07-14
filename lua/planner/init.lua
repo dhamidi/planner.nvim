@@ -3,6 +3,13 @@ local M = {}
 -- Store active processes
 local active_processes = {}
 
+-- Create namespace for planner virtual text
+local namespace = vim.api.nvim_create_namespace('planner')
+
+-- Spinner animation frames
+local spinner_frames = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+local spinner_index = 1
+
 -- Prepare input for subprocess
 local function prepare_llm_prompt(file_contents, selected_text)
   return string.format(
@@ -133,6 +140,10 @@ function M.process_selected_text()
     start_time = vim.loop.now(),
     timer = vim.loop.new_timer(),
     handle = handle,
+    extmark_id = nil,
+    selection_start = {start_line, start_col},
+    selection_end = {end_line, end_col},
+    selected_text = selected_text,
   }
 
   -- Set up completion callback with captured pid
@@ -157,68 +168,33 @@ function M.process_selected_text()
 
       local process_info = active_processes[pid]
       if process_info then
-        -- Replace placeholder with stdout
-        local placeholder_pattern = "%[working%-" .. pid .. " %d+s%]"
         local bufnr = process_info.bufnr
-        local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        local start_line, start_col = process_info.selection_start[1], process_info.selection_start[2]
+        local end_line, end_col = process_info.selection_end[1], process_info.selection_end[2]
 
-        log(string.format("Looking for pattern: %s", placeholder_pattern))
-        log(string.format("Buffer has %d lines", #lines))
-
-        local found = false
-        for i, line in ipairs(lines) do
-          log(string.format("Line %d: '%s'", i, line))
-          if string.find(line, placeholder_pattern) then
-            log(string.format("Found placeholder in line %d: '%s'", i, line))
-
-            -- Split response into lines and remove empty trailing line
-            local response_lines = vim.split(response_content, "\n")
-            if response_lines[#response_lines] == "" then
-              table.remove(response_lines, #response_lines)
-            end
-
-            -- Find the placeholder position in the line
-            local before_placeholder, placeholder_match, after_placeholder =
-              string.match(line, "^(.-)(" .. placeholder_pattern .. ")(.*)$")
-            if before_placeholder then
-              -- Split the line at the placeholder
-              local prefix = before_placeholder or ""
-              local suffix = after_placeholder or ""
-
-              -- Create new lines
-              local new_lines = {}
-              for j, response_line in ipairs(response_lines) do
-                if j == 1 then
-                  -- First line: prefix + response_line
-                  table.insert(new_lines, prefix .. response_line)
-                elseif j == #response_lines then
-                  -- Last line: response_line + suffix
-                  table.insert(new_lines, response_line .. suffix)
-                else
-                  -- Middle lines: just response_line
-                  table.insert(new_lines, response_line)
-                end
-              end
-
-              -- Handle case where there's only one response line
-              if #response_lines == 1 then
-                new_lines = { prefix .. response_lines[1] .. suffix }
-              end
-
-              -- Replace the single line with multiple lines
-              vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, new_lines)
-              log(string.format("Replaced with %d lines", #new_lines))
-              for k, new_line in ipairs(new_lines) do
-                log(string.format("  Line %d: '%s'", k, new_line))
-              end
-              found = true
-              break
-            end
-          end
+        -- Clear the virtual text
+        if process_info.extmark_id then
+          vim.api.nvim_buf_del_extmark(bufnr, namespace, process_info.extmark_id)
         end
 
-        if not found then
-          log("Placeholder not found in any line")
+        -- Split response into lines and remove empty trailing line
+        local response_lines = vim.split(response_content, "\n")
+        if response_lines[#response_lines] == "" then
+          table.remove(response_lines, #response_lines)
+        end
+
+        -- Replace the selected text with the LLM response
+        if end_col == -1 then
+          -- Visual line mode - replace entire lines
+          vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, response_lines)
+        else
+          -- Character/block mode - replace text range
+          vim.api.nvim_buf_set_text(bufnr, start_line, start_col, end_line, end_col, response_lines)
+        end
+
+        log(string.format("Replaced selection with %d lines", #response_lines))
+        for k, new_line in ipairs(response_lines) do
+          log(string.format("  Line %d: '%s'", k, new_line))
         end
 
         -- Clean up
@@ -264,22 +240,24 @@ function M.process_selected_text()
     stdin_pipe:close()
   end)
 
-  -- Create placeholder with PID
-  local placeholder = "[working-" .. pid .. " 0s]"
+  -- Create virtual text placeholder at the end of the selection
+  local placeholder_line = end_line
+  local placeholder_col = (end_col == -1) and 0 or end_col
+  
+  -- Create extmark with virtual text
+  local extmark_id = vim.api.nvim_buf_set_extmark(0, namespace, placeholder_line, placeholder_col, {
+    virt_text = {{" " .. spinner_frames[1] .. " Processing...", "Comment"}},
+    virt_text_pos = "eol",
+    ephemeral = false,
+  })
+  
+  -- Store the extmark ID
+  active_processes[pid].extmark_id = extmark_id
 
-  -- Replace the selected text with placeholder
-  if end_col == -1 then
-    -- Visual line mode - replace entire lines
-    vim.api.nvim_buf_set_lines(0, start_line, end_line + 1, false, { placeholder })
-  else
-    -- Character/block mode - replace text range
-    vim.api.nvim_buf_set_text(0, start_line, start_col, end_line, end_col, { placeholder })
-  end
-
-  -- Start timer to update counter
+  -- Start timer to update spinner and counter
   active_processes[pid].timer:start(
-    1000,
-    1000,
+    500,
+    500,
     vim.schedule_wrap(function()
       local process_info = active_processes[pid]
       if not process_info then
@@ -287,19 +265,26 @@ function M.process_selected_text()
       end
 
       local elapsed = math.floor((vim.loop.now() - process_info.start_time) / 1000)
-      local new_placeholder = "[working-" .. pid .. " " .. elapsed .. "s]"
-
-      -- Find and update the placeholder
-      local bufnr = process_info.bufnr
-      local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-
-      for i, line in ipairs(lines) do
-        local old_pattern = "%[working%-" .. pid .. " %d+s%]"
-        if string.find(line, old_pattern) then
-          local new_line = string.gsub(line, old_pattern, new_placeholder)
-          vim.api.nvim_buf_set_lines(bufnr, i - 1, i, false, { new_line })
-          break
-        end
+      
+      -- Update spinner animation
+      spinner_index = (spinner_index % #spinner_frames) + 1
+      local spinner = spinner_frames[spinner_index]
+      
+      -- Update virtual text with spinner and elapsed time
+      local new_text = string.format(" %s Processing... %ds", spinner, elapsed)
+      
+      -- Update the extmark with new virtual text
+      if process_info.extmark_id then
+        local bufnr = process_info.bufnr
+        local placeholder_line = process_info.selection_end[1]
+        local placeholder_col = (process_info.selection_end[2] == -1) and 0 or process_info.selection_end[2]
+        
+        vim.api.nvim_buf_set_extmark(bufnr, namespace, placeholder_line, placeholder_col, {
+          id = process_info.extmark_id,
+          virt_text = {{new_text, "Comment"}},
+          virt_text_pos = "eol",
+          ephemeral = false,
+        })
       end
     end)
   )

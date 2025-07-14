@@ -8,7 +8,7 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
 
 ## Improvements
 
-### Using extmarks instead of placeholders
+### Using extmarks instead of placeholders - DONE
 
 1. Remove current real text placeholder insertion logic
 2. Research neovim's virtual text API (`vim.api.nvim_buf_set_extmark`)
@@ -44,3 +44,33 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
 6. Handle virtual text cleanup when LLM processing completes
 7. Test virtual text behavior with cursor movement and buffer edits
 8. Ensure virtual text doesn't interfere with normal editing operations
+
+### Aborting running processes
+
+1. Set up keymap for `<leader> p a` (abort) in plugin setup
+2. Implement process tracking system
+   a. Create table to map extmark IDs to process PIDs
+   b. Store extmark positions and associated process information
+   c. Update tracking when new processes start
+3. Implement cursor proximity detection for virtual text
+   a. Get current cursor position: `vim.api.nvim_win_get_cursor()`
+   b. Query extmarks in current buffer: `vim.api.nvim_buf_get_extmarks()`
+   c. Check if cursor is within range of any tracked process extmarks
+   d. Return matching process info if cursor is adjacent to virtual text
+4. Implement process termination logic
+   a. Use `vim.loop.kill(pid, signal)` to send SIGTERM to process
+   b. Add fallback SIGKILL if process doesn't respond
+   c. Handle process cleanup and remove from tracking table
+5. Implement virtual text cleanup after abort
+   a. Remove extmark: `vim.api.nvim_buf_del_extmark()`
+   b. Clear namespace if no other processes running
+   c. Remove process from tracking table
+6. Add user feedback for abort action
+   a. Show "Process aborted" message using `vim.notify()`
+   b. Handle cases where no process found at cursor
+   c. Display error if process termination fails
+7. Test abort functionality
+   a. Start process with `<leader> p p`, then abort with `<leader> p a`
+   b. Verify process actually terminates and virtual text disappears
+   c. Test cursor positioning edge cases (before/after virtual text)
+   d. Ensure abort works with multiple concurrent processes
