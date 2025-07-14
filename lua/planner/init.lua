@@ -290,12 +290,88 @@ function M.process_selected_text()
   )
 end
 
+-- Find active process at cursor position
+local function find_process_at_cursor()
+  local cursor_pos = vim.api.nvim_win_get_cursor(0)
+  local cursor_line = cursor_pos[1] - 1  -- Convert to 0-indexed
+  local cursor_col = cursor_pos[2]
+  
+  -- Get all extmarks in the buffer
+  local extmarks = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, {details = true})
+  
+  for _, extmark in ipairs(extmarks) do
+    local extmark_id = extmark[1]
+    local extmark_line = extmark[2]
+    local extmark_col = extmark[3]
+    
+    -- Check if cursor is on or near the extmark line
+    if cursor_line == extmark_line then
+      -- Find the process with this extmark ID
+      for pid, process_info in pairs(active_processes) do
+        if process_info.extmark_id == extmark_id then
+          return pid, process_info
+        end
+      end
+    end
+  end
+  
+  return nil, nil
+end
+
+-- Abort process at cursor position
+function M.abort_process()
+  local pid, process_info = find_process_at_cursor()
+  
+  if not pid then
+    vim.notify("No active process found at cursor position", vim.log.levels.WARN)
+    return
+  end
+  
+  log(string.format("Aborting process %s", tostring(pid)))
+  
+  -- Try to kill the process
+  local success = vim.loop.kill(pid, "sigterm")
+  if not success then
+    -- Fallback to SIGKILL
+    success = vim.loop.kill(pid, "sigkill")
+  end
+  
+  if success then
+    -- Clean up virtual text
+    if process_info.extmark_id then
+      vim.api.nvim_buf_del_extmark(process_info.bufnr, namespace, process_info.extmark_id)
+    end
+    
+    -- Stop and close timer
+    if process_info.timer then
+      process_info.timer:stop()
+      process_info.timer:close()
+    end
+    
+    -- Remove from active processes
+    active_processes[pid] = nil
+    
+    vim.notify("Process aborted", vim.log.levels.INFO)
+    log(string.format("Successfully aborted process %s", tostring(pid)))
+  else
+    vim.notify("Failed to abort process", vim.log.levels.ERROR)
+    log(string.format("Failed to abort process %s", tostring(pid)))
+  end
+end
+
 function M.setup(opts)
   opts = opts or {}
 
   -- Set up default key mapping
   vim.keymap.set("v", "<leader>pp", M.process_selected_text, {
     desc = "Process selected text",
+    noremap = true,
+    silent = true,
+  })
+  
+  -- Set up abort key mapping
+  vim.keymap.set("n", "<leader>pa", M.abort_process, {
+    desc = "Abort planner process at cursor",
     noremap = true,
     silent = true,
   })

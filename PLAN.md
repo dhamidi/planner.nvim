@@ -45,7 +45,7 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
 7. Test virtual text behavior with cursor movement and buffer edits
 8. Ensure virtual text doesn't interfere with normal editing operations
 
-### Aborting running processes
+### Aborting running processes - DONE
 
 1. Set up keymap for `<leader> p a` (abort) in plugin setup
 2. Implement process tracking system
@@ -74,3 +74,54 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
    b. Verify process actually terminates and virtual text disappears
    c. Test cursor positioning edge cases (before/after virtual text)
    d. Ensure abort works with multiple concurrent processes
+
+### Showing process output preview
+
+1. Set up stdout monitoring for the amp process
+   a. Modify `vim.loop.spawn()` call to include stdout pipe setup
+   b. Set `stdio = {nil, vim.loop.new_pipe(false), nil}` to capture stdout
+   c. Store stdout handle reference in process tracking table
+   d. Add error handling for pipe creation failures
+
+2. Implement stdout data reading and buffering
+   a. Use `stdout:read_start()` to begin reading output stream
+   b. Create buffer to accumulate partial output chunks
+   c. Handle line-by-line reading vs continuous stream data
+   d. Store last received chunk in process tracking table
+
+3. Extract and format last 20 characters of output
+   a. Trim whitespace and newlines from raw output chunk
+   b. Take last 20 characters: `string.sub(output, -20)`
+   c. Handle multi-byte UTF-8 characters properly to avoid truncation
+   d. Escape special characters that might break virtual text display
+   e. Add ellipsis "..." if output is longer than 20 characters
+
+4. Implement elapsed time tracking for each process
+   a. Store start time when process begins: `vim.loop.hrtime()`
+   b. Calculate elapsed time in timer callback: `(vim.loop.hrtime() - start_time) / 1e9`
+   c. Format time as seconds: `string.format("%.1fs", elapsed)`
+   d. Update time display in virtual text every timer tick
+
+5. Create formatted virtual text display string
+   a. Combine spinner, time, and output: `spinner .. " Processing (" .. time .. ") " .. output`
+   b. Apply syntax highlighting to different components
+   c. Handle edge cases: empty output, very long output, special characters
+   d. Ensure total display length doesn't exceed reasonable limits
+
+6. Update virtual text with live output preview
+   a. Modify existing timer callback to include output preview
+   b. Update extmark text with new formatted string each timer tick
+   c. Handle case where no output received yet (show just spinner + time)
+   d. Ensure virtual text updates smoothly without flicker
+
+7. Handle process completion and cleanup
+   a. Stop stdout reading when process exits
+   b. Close stdout pipe handle: `stdout:close()`
+   c. Remove stdout reference from process tracking table
+   d. Final virtual text should show completion status, not preview
+
+8. Test output preview functionality
+   a. Verify output appears within 20 character limit
+   b. Test with various output patterns (short, long, special chars)
+   c. Ensure timer updates smoothly with spinner + time + output
+   d. Test edge cases: no output, binary output, very fast output
