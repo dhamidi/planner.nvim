@@ -177,30 +177,6 @@ local function cleanup_process(pid)
     process_info.check_timer:close()
   end
   
-  -- Close pipes (only if not already closed)
-  if process_info.stdout_pipe then
-    local success, err = pcall(function()
-      if not process_info.stdout_pipe:is_closing() then
-        process_info.stdout_pipe:close()
-      end
-    end)
-    if not success then
-      log(string.format("Error closing stdout pipe for PID %s: %s", tostring(pid), tostring(err)))
-    end
-  end
-  
-  -- Close process handle (only if not already closed)
-  if process_info.handle then
-    local success, err = pcall(function()
-      if not process_info.handle:is_closing() then
-        process_info.handle:close()
-      end
-    end)
-    if not success then
-      log(string.format("Error closing handle for PID %s: %s", tostring(pid), tostring(err)))
-    end
-  end
-  
   -- Clean up temp file
   if process_info.response_file and vim.fn.filereadable(process_info.response_file) == 1 then
     os.remove(process_info.response_file)
