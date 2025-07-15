@@ -13,15 +13,17 @@ local config = {}
 -- Store active processes
 local active_processes = {}
 
+-- Track buffers with attached locks
+local locked_buffers = {}
+
 -- Create namespace for planner virtual text
 local namespace = vim.api.nvim_create_namespace('planner')
 
 -- Spinner animation frames
 local spinner_frames = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
-local spinner_index = 1
 
 -- Prepare input for subprocess
-local function prepare_llm_prompt(file_contents, selected_text)
+local function prepare_llm_prompt(file_contents, selected_text, response_file)
   local prompt = "You are the technical planner, operating on a markdown file.\n\n"
   
   -- Add custom instructions if provided
@@ -42,7 +44,7 @@ If selected_text contains the word "study", actually perform the research and in
 <plan_file>%s</plan_file>
 <selected_text>%s</selected_text>
   ]],
-    config.response_path,
+    response_file,
     file_contents,
     selected_text
   )
@@ -52,8 +54,8 @@ end
 
 -- Generate preview text from stdout data
 local function generate_preview(data)
-  -- Remove unicode box drawing characters (U+2500-U+257F)
-  local cleaned = data:gsub("[\u{2500}-\u{257F}]", "")
+  -- Remove common box drawing characters (Lua doesn't support unicode ranges well)
+  local cleaned = data:gsub("[─│┌┐└┘├┤┬┴┼║═╔╗╚╝╠╣╦╩╬]", "")
   
   -- Split into lines and remove empty lines
   local lines = {}
@@ -83,6 +85,113 @@ local function log(msg)
     file:write(log_entry)
     file:close()
   end
+end
+
+-- Check for overlapping processes
+local function check_for_overlaps(bufnr, start_line, start_col, end_line, end_col)
+  for pid, process_info in pairs(active_processes) do
+    if process_info.bufnr == bufnr then
+      local start_pos = vim.api.nvim_buf_get_extmark_by_id(
+        bufnr, namespace, process_info.start_extmark_id, {}
+      )
+      local end_pos = vim.api.nvim_buf_get_extmark_by_id(
+        bufnr, namespace, process_info.end_extmark_id, {}
+      )
+      
+      if start_pos and #start_pos >= 2 and end_pos and #end_pos >= 2 then
+        local proc_start_row, proc_end_row = start_pos[1], end_pos[1]
+        -- Check for overlap (ranges overlap if not completely separate)
+        if not (end_line < proc_start_row or start_line > proc_end_row) then
+          return pid
+        end
+      end
+    end
+  end
+  return nil
+end
+
+-- Set up buffer locking
+local function setup_buffer_lock(bufnr)
+  if locked_buffers[bufnr] then
+    return -- Already set up
+  end
+  
+  locked_buffers[bufnr] = true
+  
+  vim.api.nvim_buf_attach(bufnr, false, {
+    on_lines = function(_, _, changedtick, firstline, lastline, new_lastline)
+      -- Check if change overlaps with any active process regions
+      for pid, process_info in pairs(active_processes) do
+        if process_info.bufnr == bufnr then
+          local start_pos = vim.api.nvim_buf_get_extmark_by_id(
+            bufnr, namespace, process_info.start_extmark_id, {}
+          )
+          local end_pos = vim.api.nvim_buf_get_extmark_by_id(
+            bufnr, namespace, process_info.end_extmark_id, {}
+          )
+          
+          if start_pos and #start_pos >= 2 and end_pos and #end_pos >= 2 then
+            local start_row, end_row = start_pos[1], end_pos[1]
+            if firstline <= end_row and lastline >= start_row then
+              vim.notify("Cannot edit text being processed by PID " .. pid, 
+                        vim.log.levels.WARN)
+              return true -- prevent the change
+            end
+          end
+        end
+      end
+    end
+  })
+end
+
+-- Clean up process resources
+local function cleanup_process(pid)
+  local process_info = active_processes[pid]
+  if not process_info then return end
+  
+  -- Stop and close spinner timer
+  if process_info.timer then
+    process_info.timer:stop()
+    process_info.timer:close()
+  end
+  
+  -- Stop and close check timer
+  if process_info.check_timer then
+    process_info.check_timer:stop()
+    process_info.check_timer:close()
+  end
+  
+  -- Close pipes (only if not already closed)
+  if process_info.stdout_pipe then
+    local success, err = pcall(function()
+      if not process_info.stdout_pipe:is_closing() then
+        process_info.stdout_pipe:close()
+      end
+    end)
+    if not success then
+      log(string.format("Error closing stdout pipe for PID %s: %s", tostring(pid), tostring(err)))
+    end
+  end
+  
+  -- Close process handle (only if not already closed)
+  if process_info.handle then
+    local success, err = pcall(function()
+      if not process_info.handle:is_closing() then
+        process_info.handle:close()
+      end
+    end)
+    if not success then
+      log(string.format("Error closing handle for PID %s: %s", tostring(pid), tostring(err)))
+    end
+  end
+  
+  -- Clean up temp file
+  if process_info.response_file and vim.fn.filereadable(process_info.response_file) == 1 then
+    os.remove(process_info.response_file)
+  end
+  
+  -- Remove from active processes
+  active_processes[pid] = nil
 end
 
 function M.process_selected_text()
@@ -116,16 +225,19 @@ function M.process_selected_text()
   local start_col = start_pos[3] - 1
   local end_col = end_pos[3]
 
-  -- Handle different visual modes
+  -- Determine visual mode type
+  local visual_mode
   if mode == "V" then
     -- Visual line mode - select entire lines
-    -- In line mode, start_col should be 0 and end_col should be v:maxcol
+    visual_mode = "line"
     start_col = 0
     end_col = -1 -- Use -1 as our special marker for line mode
   elseif mode == "\22" then
     -- Visual block mode - keep as is
+    visual_mode = "block"
   else
     -- Character visual mode - ensure proper column range
+    visual_mode = "char"
     -- In character mode, end_col is inclusive, so we need to add 1 for exclusive end
     if start_line == end_line then
       end_col = end_col + 1
@@ -147,13 +259,17 @@ function M.process_selected_text()
 
   log(string.format("Selected text: '%s'", selected_text))
 
+  -- Check for overlapping processes before starting
+  local current_bufnr = vim.api.nvim_get_current_buf()
+  local overlapping_pid = check_for_overlaps(current_bufnr, start_line, start_col, end_line, end_col)
+  if overlapping_pid then
+    vim.notify("Cannot start: overlaps with process " .. overlapping_pid, vim.log.levels.WARN)
+    return
+  end
+
   -- Get entire file contents
   local file_contents = table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "\n")
   log(string.format("File contents length: %d", #file_contents))
-
-  -- Generate LLM prompt
-  local llm_input = prepare_llm_prompt(file_contents, selected_text)
-  log(string.format("LLM input length: %d", #llm_input))
 
   -- Exit visual mode
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", true)
@@ -174,18 +290,42 @@ function M.process_selected_text()
 
   log(string.format("Spawned process with PID: %s", tostring(pid)))
 
-  -- Store process info immediately
+  -- Create unique response file for this process
+  local response_file = vim.fn.tempname() .. "-planner-" .. pid .. ".txt"
+  
+  -- Generate LLM prompt with unique response file
+  local llm_input = prepare_llm_prompt(file_contents, selected_text, response_file)
+  log(string.format("LLM input length: %d", #llm_input))
+
+  -- Create extmark pair for region tracking
+  local start_extmark_id = vim.api.nvim_buf_set_extmark(0, namespace, start_line, start_col, {
+    right_gravity = false,  -- left-sticky
+  })
+  -- For line mode, use column 0 instead of -1
+  local end_extmark_col = (visual_mode == "line") and 0 or end_col
+  local end_extmark_id = vim.api.nvim_buf_set_extmark(0, namespace, end_line, end_extmark_col, {
+    right_gravity = true,   -- right-sticky
+    virt_text = {{" " .. spinner_frames[1] .. " Processing...", "Comment"}},
+    virt_text_pos = "eol",
+    hl_group = 'ErrorMsg',
+    priority = 200
+  })
+
+  -- Store process info with extmark IDs
   active_processes[pid] = {
     bufnr = vim.api.nvim_get_current_buf(),
     start_time = vim.loop.hrtime(),
     timer = vim.loop.new_timer(),
     handle = handle,
     stdout_pipe = stdout_pipe,
-    extmark_id = nil,
-    selection_start = {start_line, start_col},
-    selection_end = {end_line, end_col},
+    start_extmark_id = start_extmark_id,
+    end_extmark_id = end_extmark_id,
+    mode = visual_mode,
+    orig_hash = vim.fn.sha256(selected_text),
+    response_file = response_file,
     selected_text = selected_text,
     last_output = "",
+    spinner_index = 1,  -- per-process spinner state
   }
 
   -- Set up completion callback with captured pid
@@ -193,68 +333,91 @@ function M.process_selected_text()
     vim.schedule(function()
       log(string.format("Process %s finished with code %s", tostring(pid), tostring(code)))
 
-      -- Read response from file
-      local file = io.open(config.response_path, "r")
+      local process_info = active_processes[pid]
+      if not process_info then
+        log("No process info found for PID " .. tostring(pid))
+        return
+      end
+
+      -- Read response from unique file
+      local file = io.open(process_info.response_file, "r")
       local response_content = ""
 
       if file then
         response_content = file:read("*all")
         file:close()
         log(string.format("Read response from file: '%s'", response_content))
+        -- Clean up temp file
+        os.remove(process_info.response_file)
       else
-        log("Failed to read response file")
+        log("Failed to read response file: " .. (process_info.response_file or "unknown"))
         response_content = "Error: Could not read response file"
       end
-
-      local process_info = active_processes[pid]
-      if process_info then
-        local bufnr = process_info.bufnr
-        local start_line, start_col = process_info.selection_start[1], process_info.selection_start[2]
-        local end_line, end_col = process_info.selection_end[1], process_info.selection_end[2]
-
-        -- Clear the virtual text
-        if process_info.extmark_id then
-          vim.api.nvim_buf_del_extmark(bufnr, namespace, process_info.extmark_id)
-        end
-
-        -- Split response into lines and remove empty trailing line
-        local response_lines = vim.split(response_content, "\n")
-        if response_lines[#response_lines] == "" then
-          table.remove(response_lines, #response_lines)
-        end
-
-        -- Replace the selected text with the LLM response
-        if end_col == -1 then
-          -- Visual line mode - replace entire lines
-          vim.api.nvim_buf_set_lines(bufnr, start_line, end_line + 1, false, response_lines)
-        else
-          -- Character/block mode - replace text range
-          vim.api.nvim_buf_set_text(bufnr, start_line, start_col, end_line, end_col, response_lines)
-        end
-
-        log(string.format("Replaced selection with %d lines", #response_lines))
-        for k, new_line in ipairs(response_lines) do
-          log(string.format("  Line %d: '%s'", k, new_line))
-        end
-
-        -- Clean up
-        if process_info.timer then
-          process_info.timer:stop()
-          process_info.timer:close()
-        end
-        if process_info.stdout_pipe then
-          process_info.stdout_pipe:close()
-        end
-        active_processes[pid] = nil
-      else
-        log("No process info found for PID " .. tostring(pid))
+      
+      local bufnr = process_info.bufnr
+      
+      -- Get current region boundaries from extmarks
+      local start_pos = vim.api.nvim_buf_get_extmark_by_id(
+        bufnr, namespace, process_info.start_extmark_id, {}
+      )
+      local end_pos = vim.api.nvim_buf_get_extmark_by_id(
+        bufnr, namespace, process_info.end_extmark_id, {}
+      )
+      
+      local start_row, start_col, end_row, end_col
+      if start_pos and #start_pos >= 2 then
+        start_row, start_col = start_pos[1], start_pos[2]
       end
+      if end_pos and #end_pos >= 2 then
+        end_row, end_col = end_pos[1], end_pos[2]
+      end
+      
+      if not start_row or not end_row then
+        log("Extmarks vanished - cannot apply result for PID " .. pid)
+        cleanup_process(pid)
+        return
+      end
+
+      -- Clear the extmarks
+      vim.api.nvim_buf_del_extmark(bufnr, namespace, process_info.start_extmark_id)
+      vim.api.nvim_buf_del_extmark(bufnr, namespace, process_info.end_extmark_id)
+
+      -- Split response into lines and remove empty trailing line
+      local response_lines = vim.split(response_content, "\n")
+      if response_lines[#response_lines] == "" then
+        table.remove(response_lines, #response_lines)
+      end
+
+      -- Replace the selected text with the LLM response
+      if process_info.mode == "line" then
+        -- Visual line mode - replace entire lines
+        vim.api.nvim_buf_set_lines(bufnr, start_row, end_row + 1, false, response_lines)
+      else
+        -- Character/block mode - replace text range
+        -- For extmarks, we need to get the actual end position, not the stored -1
+        local actual_end_col = end_col
+        if actual_end_col == -1 then
+          -- This shouldn't happen anymore, but just in case
+          actual_end_col = 0
+        end
+        vim.api.nvim_buf_set_text(bufnr, start_row, start_col, end_row, actual_end_col, response_lines)
+      end
+
+      log(string.format("Replaced selection with %d lines", #response_lines))
+      for k, new_line in ipairs(response_lines) do
+        log(string.format("  Line %d: '%s'", k, new_line))
+      end
+
+      -- Clean up
+      cleanup_process(pid)
       -- stdin_pipe is already closed after writing
     end)
   end
 
-  -- Use a timer to periodically check if process is done
+  -- Store the check timer for cleanup
   local check_timer = vim.loop.new_timer()
+  active_processes[pid].check_timer = check_timer
+  
   check_timer:start(100, 100, function()
     if not active_processes[pid] then
       check_timer:stop()
@@ -300,19 +463,10 @@ function M.process_selected_text()
     stdin_pipe:close()
   end)
 
-  -- Create virtual text placeholder at the end of the selection
-  local placeholder_line = end_line
-  local placeholder_col = (end_col == -1) and 0 or end_col
-  
-  -- Create extmark with virtual text
-  local extmark_id = vim.api.nvim_buf_set_extmark(0, namespace, placeholder_line, placeholder_col, {
-    virt_text = {{" " .. spinner_frames[1] .. " Processing...", "Comment"}},
-    virt_text_pos = "eol",
-    ephemeral = false,
-  })
-  
-  -- Store the extmark ID
-  active_processes[pid].extmark_id = extmark_id
+  log(string.format("Created extmarks: start=%d, end=%d", start_extmark_id, end_extmark_id))
+
+  -- Set up buffer lock if not already done
+  setup_buffer_lock(current_bufnr)
 
   -- Start timer to update spinner and counter
   active_processes[pid].timer:start(
@@ -326,16 +480,16 @@ function M.process_selected_text()
 
       local elapsed = (vim.loop.hrtime() - process_info.start_time) / 1e9
       
-      -- Update spinner animation
-      spinner_index = (spinner_index % #spinner_frames) + 1
-      local spinner = spinner_frames[spinner_index]
+      -- Update spinner animation per process
+      process_info.spinner_index = (process_info.spinner_index % #spinner_frames) + 1
+      local spinner = spinner_frames[process_info.spinner_index]
       
       -- Format elapsed time
       local time_str = string.format("%.1fs", elapsed)
       
       -- Build display text with spinner, time, and output preview
       local display_text = string.format(" %s Processing (%s)", spinner, time_str)
-      if process_info.last_output ~= "" then
+      if process_info.last_output and process_info.last_output ~= "" then
         -- Add ellipsis if the preview was truncated (20 chars is the max from generate_preview)
         local preview = process_info.last_output
         if #preview == 20 then
@@ -344,20 +498,30 @@ function M.process_selected_text()
         display_text = display_text .. " " .. preview
       end
       
-      local new_text = display_text
+      -- Get current extmark position
+      local extmark_pos = vim.api.nvim_buf_get_extmark_by_id(
+        process_info.bufnr, namespace, process_info.end_extmark_id, {}
+      )
       
-      -- Update the extmark with new virtual text
-      if process_info.extmark_id then
-        local bufnr = process_info.bufnr
-        local placeholder_line = process_info.selection_end[1]
-        local placeholder_col = (process_info.selection_end[2] == -1) and 0 or process_info.selection_end[2]
-        
-        vim.api.nvim_buf_set_extmark(bufnr, namespace, placeholder_line, placeholder_col, {
-          id = process_info.extmark_id,
-          virt_text = {{new_text, "Comment"}},
-          virt_text_pos = "eol",
-          ephemeral = false,
-        })
+      -- Update the extmark with new virtual text (don't reposition)
+      if extmark_pos and #extmark_pos >= 2 then
+        local end_row, end_col = extmark_pos[1], extmark_pos[2]
+        if end_col >= 0 then
+          -- Update only the virtual text properties, let extmark keep its position
+          vim.api.nvim_buf_set_extmark(process_info.bufnr, namespace, end_row, end_col, {
+            id = process_info.end_extmark_id,
+            virt_text = {{display_text, "Comment"}},
+            virt_text_pos = "eol",
+            hl_group = 'ErrorMsg',
+            priority = 200
+          })
+        else
+          -- Fallback for invalid column - just log it
+          log(string.format("Invalid column for extmark update: row=%d, col=%d", end_row, end_col))
+        end
+      else
+        -- Extmark no longer exists
+        log(string.format("Extmark %d no longer exists for PID %s", process_info.end_extmark_id, tostring(pid)))
       end
     end)
   )
@@ -367,21 +531,21 @@ end
 local function find_process_at_cursor()
   local cursor_pos = vim.api.nvim_win_get_cursor(0)
   local cursor_line = cursor_pos[1] - 1  -- Convert to 0-indexed
-  local cursor_col = cursor_pos[2]
+  local current_bufnr = vim.api.nvim_get_current_buf()
   
-  -- Get all extmarks in the buffer
-  local extmarks = vim.api.nvim_buf_get_extmarks(0, namespace, 0, -1, {details = true})
-  
-  for _, extmark in ipairs(extmarks) do
-    local extmark_id = extmark[1]
-    local extmark_line = extmark[2]
-    local extmark_col = extmark[3]
-    
-    -- Check if cursor is on or near the extmark line
-    if cursor_line == extmark_line then
-      -- Find the process with this extmark ID
-      for pid, process_info in pairs(active_processes) do
-        if process_info.extmark_id == extmark_id then
+  -- Find process by checking if cursor is within any active region
+  for pid, process_info in pairs(active_processes) do
+    if process_info.bufnr == current_bufnr then
+      local start_pos = vim.api.nvim_buf_get_extmark_by_id(
+        process_info.bufnr, namespace, process_info.start_extmark_id, {}
+      )
+      local end_pos = vim.api.nvim_buf_get_extmark_by_id(
+        process_info.bufnr, namespace, process_info.end_extmark_id, {}
+      )
+      
+      if start_pos and #start_pos >= 2 and end_pos and #end_pos >= 2 then
+        local start_row, end_row = start_pos[1], end_pos[1]
+        if cursor_line >= start_row and cursor_line <= end_row then
           return pid, process_info
         end
       end
@@ -410,26 +574,14 @@ function M.abort_process()
   end
   
   if success then
-    -- Clean up virtual text
-    if process_info.extmark_id then
-      vim.api.nvim_buf_del_extmark(process_info.bufnr, namespace, process_info.extmark_id)
-    end
+    -- Clean up extmarks
+    vim.api.nvim_buf_del_extmark(process_info.bufnr, namespace, process_info.start_extmark_id)
+    vim.api.nvim_buf_del_extmark(process_info.bufnr, namespace, process_info.end_extmark_id)
     
-    -- Stop and close timer
-    if process_info.timer then
-      process_info.timer:stop()
-      process_info.timer:close()
-    end
+    -- Clean up process resources
+    cleanup_process(pid)
     
-    -- Close stdout pipe
-    if process_info.stdout_pipe then
-      process_info.stdout_pipe:close()
-    end
-    
-    -- Remove from active processes
-    active_processes[pid] = nil
-    
-    vim.notify("Process aborted", vim.log.levels.INFO)
+    vim.notify("Process " .. pid .. " aborted", vim.log.levels.INFO)
     log(string.format("Successfully aborted process %s", tostring(pid)))
   else
     vim.notify("Failed to abort process", vim.log.levels.ERROR)
