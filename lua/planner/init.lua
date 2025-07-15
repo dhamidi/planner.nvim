@@ -67,17 +67,17 @@ end
 
 -- Per-process logging function
 local function log_process_output(pid, stream, data)
-local process_info = active_processes[pid]
-if not process_info or not process_info.log_file then
-return
-end
+  local process_info = active_processes[pid]
+  if not process_info or not process_info.log_file then
+    return
+  end
 
--- Write raw data without timestamps or stream labels
-local file = io.open(process_info.log_file, "a")
-if file then
-  file:write(data)
-  file:close()
-end
+  -- Write raw data without timestamps or stream labels
+  local file = io.open(process_info.log_file, "a")
+  if file then
+    file:write(data)
+    file:close()
+  end
 end
 
 -- Check for overlapping processes
@@ -175,13 +175,23 @@ local function cleanup_process(pid)
   -- Stop and close spinner timer
   if process_info.timer then
     process_info.timer:stop()
-    process_info.timer:close()
+    local success, err = pcall(function()
+      process_info.timer:close()
+    end)
+    if not success and not string.match(err, "already closing") then
+      log("Error closing timer: " .. err)
+    end
   end
 
   -- Stop and close check timer
   if process_info.check_timer then
     process_info.check_timer:stop()
-    process_info.check_timer:close()
+    local success, err = pcall(function()
+      process_info.check_timer:close()
+    end)
+    if not success and not string.match(err, "already closing") then
+      log("Error closing check timer: " .. err)
+    end
   end
 
   -- Clean up temp file
@@ -575,13 +585,40 @@ function M.show_process_log()
   vim.api.nvim_buf_set_option(term_buf, "buflisted", false)
   vim.api.nvim_buf_set_option(term_buf, "swapfile", false)
 
-  -- Split current window and show terminal
-  vim.cmd("split")
-  local term_win = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(term_win, term_buf)
+  -- Get cursor position for floating window placement
+  local cursor_pos = vim.api.nvim_win_get_cursor(0)
+  local cursor_row = cursor_pos[1]
+  local cursor_col = cursor_pos[2]
 
-  -- Set window title
-  vim.api.nvim_win_set_option(term_win, "statusline", string.format("Process %s Log (tail -f)", pid))
+  -- Get screen dimensions
+  local screen_width = vim.o.columns
+  local screen_height = vim.o.lines
+
+  -- Calculate floating window size (100% width, 40% height)
+  local width = screen_width
+  local height = math.floor(screen_height * 0.4)
+
+  -- Position window under cursor, but ensure it fits on screen
+  local row = cursor_row
+  local col = 0 -- Start at left edge for full width
+
+  -- Adjust if window would go off screen
+  if row + height > screen_height - 2 then
+    row = screen_height - height - 2
+  end
+
+  -- Create floating window
+  local term_win = vim.api.nvim_open_win(term_buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = "minimal",
+    border = "rounded",
+    title = string.format("Process %s Log (tail -f)", pid),
+    title_pos = "center",
+  })
 
   -- Start tail command in terminal
   local job_id = vim.fn.termopen(string.format('tail -f "%s"', log_file), {
@@ -592,13 +629,13 @@ function M.show_process_log()
       end
     end,
   })
-  
+
   -- Enable auto-scrolling by entering insert mode
-  vim.cmd('startinsert')
-  
+  vim.cmd("startinsert")
+
   -- Set terminal to auto-scroll to bottom
-  vim.api.nvim_buf_set_option(term_buf, 'scrolloff', 0)
-  vim.api.nvim_win_set_option(term_win, 'scrolloff', 0)
+  vim.api.nvim_buf_set_option(term_buf, "scrolloff", 0)
+  vim.api.nvim_win_set_option(term_win, "scrolloff", 0)
 
   -- Set up keybindings for terminal buffer
   local function close_terminal()
