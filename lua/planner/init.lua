@@ -67,19 +67,17 @@ end
 
 -- Per-process logging function
 local function log_process_output(pid, stream, data)
-  local process_info = active_processes[pid]
-  if not process_info or not process_info.log_file then
-    return
-  end
+local process_info = active_processes[pid]
+if not process_info or not process_info.log_file then
+return
+end
 
-  local timestamp = os.date("%Y-%m-%d %H:%M:%S")
-  local log_entry = string.format("[%s] [%s] %s\n", timestamp, stream, data)
-
-  local file = io.open(process_info.log_file, "a")
-  if file then
-    file:write(log_entry)
-    file:close()
-  end
+-- Write raw data without timestamps or stream labels
+local file = io.open(process_info.log_file, "a")
+if file then
+  file:write(data)
+  file:close()
+end
 end
 
 -- Check for overlapping processes
