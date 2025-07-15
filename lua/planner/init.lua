@@ -592,6 +592,13 @@ function M.show_process_log()
       end
     end,
   })
+  
+  -- Enable auto-scrolling by entering insert mode
+  vim.cmd('startinsert')
+  
+  -- Set terminal to auto-scroll to bottom
+  vim.api.nvim_buf_set_option(term_buf, 'scrolloff', 0)
+  vim.api.nvim_win_set_option(term_win, 'scrolloff', 0)
 
   -- Set up keybindings for terminal buffer
   local function close_terminal()
