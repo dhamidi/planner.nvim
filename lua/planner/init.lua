@@ -17,22 +17,23 @@ local active_processes = {}
 local locked_buffers = {}
 
 -- Create namespace for planner virtual text
-local namespace = vim.api.nvim_create_namespace('planner')
+local namespace = vim.api.nvim_create_namespace("planner")
 
 -- Spinner animation frames
-local spinner_frames = {"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+local spinner_frames = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 
 -- Prepare input for subprocess
 local function prepare_llm_prompt(file_contents, selected_text, response_file)
   local prompt = "You are the technical planner, operating on a markdown file.\n\n"
-  
+
   -- Add custom instructions if provided
   if config.custom_instructions and config.custom_instructions ~= "" then
     prompt = prompt .. config.custom_instructions .. "\n\n"
   end
-  
-  prompt = prompt .. string.format(
-    [[The user has asked you to break down a step of the plan.
+
+  prompt = prompt
+    .. string.format(
+      [[The user has asked you to break down a step of the plan.
 
 Inspect the entire plan, and then take the selected step and break it down into more detailed steps.
 
@@ -44,15 +45,13 @@ If selected_text contains the word "study", actually perform the research and in
 <plan_file>%s</plan_file>
 <selected_text>%s</selected_text>
   ]],
-    response_file,
-    file_contents,
-    selected_text
-  )
-  
+      response_file,
+      file_contents,
+      selected_text
+    )
+
   return prompt
 end
-
-
 
 -- Logging function
 local function log(msg)
@@ -66,17 +65,30 @@ local function log(msg)
   end
 end
 
+-- Per-process logging function
+local function log_process_output(pid, stream, data)
+  local process_info = active_processes[pid]
+  if not process_info or not process_info.log_file then
+    return
+  end
+
+  local timestamp = os.date("%Y-%m-%d %H:%M:%S")
+  local log_entry = string.format("[%s] [%s] %s\n", timestamp, stream, data)
+
+  local file = io.open(process_info.log_file, "a")
+  if file then
+    file:write(log_entry)
+    file:close()
+  end
+end
+
 -- Check for overlapping processes
 local function check_for_overlaps(bufnr, start_line, start_col, end_line, end_col)
   for pid, process_info in pairs(active_processes) do
     if process_info.bufnr == bufnr then
-      local start_pos = vim.api.nvim_buf_get_extmark_by_id(
-        bufnr, namespace, process_info.start_extmark_id, {}
-      )
-      local end_pos = vim.api.nvim_buf_get_extmark_by_id(
-        bufnr, namespace, process_info.end_extmark_id, {}
-      )
-      
+      local start_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, namespace, process_info.start_extmark_id, {})
+      local end_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, namespace, process_info.end_extmark_id, {})
+
       if start_pos and #start_pos >= 2 and end_pos and #end_pos >= 2 then
         local proc_start_row, proc_end_row = start_pos[1], end_pos[1]
         -- Check for overlap (ranges overlap if not completely separate)
@@ -94,67 +106,62 @@ local function setup_buffer_lock(bufnr)
   if locked_buffers[bufnr] then
     return -- Already set up
   end
-  
+
   locked_buffers[bufnr] = true
-  
+
   vim.api.nvim_buf_attach(bufnr, false, {
     on_lines = function(_, _, changedtick, firstline, lastline, new_lastline)
       -- Check if change overlaps with any active process regions
       for pid, process_info in pairs(active_processes) do
         if process_info.bufnr == bufnr then
-          local start_pos = vim.api.nvim_buf_get_extmark_by_id(
-            bufnr, namespace, process_info.start_extmark_id, {}
-          )
-          local end_pos = vim.api.nvim_buf_get_extmark_by_id(
-            bufnr, namespace, process_info.end_extmark_id, {}
-          )
-          
+          local start_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, namespace, process_info.start_extmark_id, {})
+          local end_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, namespace, process_info.end_extmark_id, {})
+
           if start_pos and #start_pos >= 2 and end_pos and #end_pos >= 2 then
             local start_row, end_row = start_pos[1], end_pos[1]
             if firstline <= end_row and lastline >= start_row then
-              vim.notify("Cannot edit text being processed by PID " .. pid, 
-                        vim.log.levels.WARN)
+              vim.notify("Cannot edit text being processed by PID " .. pid, vim.log.levels.WARN)
               return true -- prevent the change
             end
           end
         end
       end
-    end
+    end,
   })
 end
 
 -- Update virtual text for a specific process
 local function update_virtual_text(pid)
   local process_info = active_processes[pid]
-  if not process_info then return end
-  
+  if not process_info then
+    return
+  end
+
   local elapsed = (vim.loop.hrtime() - process_info.start_time) / 1e9
-  
+
   -- Update spinner animation per process
   process_info.spinner_index = (process_info.spinner_index % #spinner_frames) + 1
   local spinner = spinner_frames[process_info.spinner_index]
-  
+
   -- Format elapsed time
   local time_str = string.format("%.1fs", elapsed)
-  
+
   -- Build display text with just spinner, time, and processing text
   local display_text = string.format(" %s Processing (%s)", spinner, time_str)
-  
+
   -- Get current extmark position
-  local extmark_pos = vim.api.nvim_buf_get_extmark_by_id(
-    process_info.bufnr, namespace, process_info.end_extmark_id, {}
-  )
-  
+  local extmark_pos = vim.api.nvim_buf_get_extmark_by_id(process_info.bufnr, namespace, process_info.end_extmark_id, {})
+
   -- Update the extmark with new virtual text
   if extmark_pos and #extmark_pos >= 2 then
     local end_row, end_col = extmark_pos[1], extmark_pos[2]
     if end_col >= 0 then
       vim.api.nvim_buf_set_extmark(process_info.bufnr, namespace, end_row, end_col, {
         id = process_info.end_extmark_id,
-        virt_text = {{display_text, "Comment"}},
+        virt_text = { { display_text, "Comment" } },
         virt_text_pos = "eol",
-        hl_group = 'ErrorMsg',
-        priority = 200
+        hl_group = "ErrorMsg",
+        priority = 200,
       })
     end
   end
@@ -163,25 +170,32 @@ end
 -- Clean up process resources
 local function cleanup_process(pid)
   local process_info = active_processes[pid]
-  if not process_info then return end
-  
+  if not process_info then
+    return
+  end
+
   -- Stop and close spinner timer
   if process_info.timer then
     process_info.timer:stop()
     process_info.timer:close()
   end
-  
+
   -- Stop and close check timer
   if process_info.check_timer then
     process_info.check_timer:stop()
     process_info.check_timer:close()
   end
-  
+
   -- Clean up temp file
   if process_info.response_file and vim.fn.filereadable(process_info.response_file) == 1 then
     os.remove(process_info.response_file)
   end
-  
+
+  -- Clean up log file
+  if process_info.log_file and vim.fn.filereadable(process_info.log_file) == 1 then
+    os.remove(process_info.log_file)
+  end
+
   -- Remove from active processes
   active_processes[pid] = nil
 end
@@ -269,10 +283,11 @@ function M.process_selected_text()
   -- Spawn the process
   local stdin_pipe = vim.loop.new_pipe(false)
   local stdout_pipe = vim.loop.new_pipe(false)
+  local stderr_pipe = vim.loop.new_pipe(false)
 
   local handle, pid = vim.loop.spawn("amp", {
     args = {},
-    stdio = { stdin_pipe, stdout_pipe, nil },
+    stdio = { stdin_pipe, stdout_pipe, stderr_pipe },
   })
 
   if not handle then
@@ -284,23 +299,26 @@ function M.process_selected_text()
 
   -- Create unique response file for this process
   local response_file = vim.fn.tempname() .. "-planner-" .. pid .. ".txt"
-  
+
+  -- Create unique log file for this process
+  local log_file = vim.fn.tempname() .. "-planner-" .. pid .. ".log"
+
   -- Generate LLM prompt with unique response file
   local llm_input = prepare_llm_prompt(file_contents, selected_text, response_file)
   log(string.format("LLM input length: %d", #llm_input))
 
   -- Create extmark pair for region tracking
   local start_extmark_id = vim.api.nvim_buf_set_extmark(0, namespace, start_line, start_col, {
-    right_gravity = false,  -- left-sticky
+    right_gravity = false, -- left-sticky
   })
   -- For line mode, use column 0 instead of -1
   local end_extmark_col = (visual_mode == "line") and 0 or end_col
   local end_extmark_id = vim.api.nvim_buf_set_extmark(0, namespace, end_line, end_extmark_col, {
-    right_gravity = true,   -- right-sticky
-    virt_text = {{" " .. spinner_frames[1] .. " Processing...", "Comment"}},
+    right_gravity = true, -- right-sticky
+    virt_text = { { " " .. spinner_frames[1] .. " Processing...", "Comment" } },
     virt_text_pos = "eol",
-    hl_group = 'ErrorMsg',
-    priority = 200
+    hl_group = "ErrorMsg",
+    priority = 200,
   })
 
   -- Store process info with extmark IDs
@@ -310,13 +328,15 @@ function M.process_selected_text()
     timer = vim.loop.new_timer(),
     handle = handle,
     stdout_pipe = stdout_pipe,
+    stderr_pipe = stderr_pipe,
     start_extmark_id = start_extmark_id,
     end_extmark_id = end_extmark_id,
     mode = visual_mode,
     orig_hash = vim.fn.sha256(selected_text),
     response_file = response_file,
+    log_file = log_file,
     selected_text = selected_text,
-    spinner_index = 1,  -- per-process spinner state
+    spinner_index = 1, -- per-process spinner state
   }
 
   -- Set up completion callback with captured pid
@@ -344,17 +364,13 @@ function M.process_selected_text()
         log("Failed to read response file: " .. (process_info.response_file or "unknown"))
         response_content = "Error: Could not read response file"
       end
-      
+
       local bufnr = process_info.bufnr
-      
+
       -- Get current region boundaries from extmarks
-      local start_pos = vim.api.nvim_buf_get_extmark_by_id(
-        bufnr, namespace, process_info.start_extmark_id, {}
-      )
-      local end_pos = vim.api.nvim_buf_get_extmark_by_id(
-        bufnr, namespace, process_info.end_extmark_id, {}
-      )
-      
+      local start_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, namespace, process_info.start_extmark_id, {})
+      local end_pos = vim.api.nvim_buf_get_extmark_by_id(bufnr, namespace, process_info.end_extmark_id, {})
+
       local start_row, start_col, end_row, end_col
       if start_pos and #start_pos >= 2 then
         start_row, start_col = start_pos[1], start_pos[2]
@@ -362,7 +378,7 @@ function M.process_selected_text()
       if end_pos and #end_pos >= 2 then
         end_row, end_col = end_pos[1], end_pos[2]
       end
-      
+
       if not start_row or not end_row then
         log("Extmarks vanished - cannot apply result for PID " .. pid)
         cleanup_process(pid)
@@ -408,7 +424,7 @@ function M.process_selected_text()
   -- Store the check timer for cleanup
   local check_timer = vim.loop.new_timer()
   active_processes[pid].check_timer = check_timer
-  
+
   check_timer:start(100, 100, function()
     if not active_processes[pid] then
       check_timer:stop()
@@ -426,13 +442,25 @@ function M.process_selected_text()
     end
   end)
 
-  -- Start reading stdout (but don't process it for display)
+  -- Start reading stdout and log to per-process file
   stdout_pipe:read_start(function(err, data)
     if err then
       log("Error reading stdout: " .. err)
+      log_process_output(pid, "STDOUT-ERROR", err)
     elseif data then
-      -- Just log the data, don't update virtual text
-      log(string.format("Stdout data: '%s'", data))
+      -- Log to per-process log file
+      log_process_output(pid, "STDOUT", data)
+    end
+  end)
+
+  -- Start reading stderr and log to per-process file
+  stderr_pipe:read_start(function(err, data)
+    if err then
+      log("Error reading stderr: " .. err)
+      log_process_output(pid, "STDERR-ERROR", err)
+    elseif data then
+      -- Log to per-process log file
+      log_process_output(pid, "STDERR", data)
     end
   end)
 
@@ -460,7 +488,7 @@ function M.process_selected_text()
       if not active_processes[pid] then
         return
       end
-      
+
       -- Use the centralized update function
       update_virtual_text(pid)
     end)
@@ -470,19 +498,16 @@ end
 -- Find active process at cursor position
 local function find_process_at_cursor()
   local cursor_pos = vim.api.nvim_win_get_cursor(0)
-  local cursor_line = cursor_pos[1] - 1  -- Convert to 0-indexed
+  local cursor_line = cursor_pos[1] - 1 -- Convert to 0-indexed
   local current_bufnr = vim.api.nvim_get_current_buf()
-  
+
   -- Find process by checking if cursor is within any active region
   for pid, process_info in pairs(active_processes) do
     if process_info.bufnr == current_bufnr then
-      local start_pos = vim.api.nvim_buf_get_extmark_by_id(
-        process_info.bufnr, namespace, process_info.start_extmark_id, {}
-      )
-      local end_pos = vim.api.nvim_buf_get_extmark_by_id(
-        process_info.bufnr, namespace, process_info.end_extmark_id, {}
-      )
-      
+      local start_pos =
+        vim.api.nvim_buf_get_extmark_by_id(process_info.bufnr, namespace, process_info.start_extmark_id, {})
+      local end_pos = vim.api.nvim_buf_get_extmark_by_id(process_info.bufnr, namespace, process_info.end_extmark_id, {})
+
       if start_pos and #start_pos >= 2 and end_pos and #end_pos >= 2 then
         local start_row, end_row = start_pos[1], end_pos[1]
         if cursor_line >= start_row and cursor_line <= end_row then
@@ -491,36 +516,36 @@ local function find_process_at_cursor()
       end
     end
   end
-  
+
   return nil, nil
 end
 
 -- Abort process at cursor position
 function M.abort_process()
   local pid, process_info = find_process_at_cursor()
-  
+
   if not pid then
     vim.notify("No active process found at cursor position", vim.log.levels.WARN)
     return
   end
-  
+
   log(string.format("Aborting process %s", tostring(pid)))
-  
+
   -- Try to kill the process
   local success = vim.loop.kill(pid, "sigterm")
   if not success then
     -- Fallback to SIGKILL
     success = vim.loop.kill(pid, "sigkill")
   end
-  
+
   if success then
     -- Clean up extmarks
     vim.api.nvim_buf_del_extmark(process_info.bufnr, namespace, process_info.start_extmark_id)
     vim.api.nvim_buf_del_extmark(process_info.bufnr, namespace, process_info.end_extmark_id)
-    
+
     -- Clean up process resources
     cleanup_process(pid)
-    
+
     vim.notify("Process " .. pid .. " aborted", vim.log.levels.INFO)
     log(string.format("Successfully aborted process %s", tostring(pid)))
   else
@@ -529,21 +554,92 @@ function M.abort_process()
   end
 end
 
+-- Show process log in terminal window
+function M.show_process_log()
+  local pid, process_info = find_process_at_cursor()
+
+  if not pid then
+    vim.notify("No active process found at cursor position", vim.log.levels.WARN)
+    return
+  end
+
+  local log_file = process_info.log_file
+  if not log_file or vim.fn.filereadable(log_file) == 0 then
+    vim.notify("No log file found for process " .. pid, vim.log.levels.WARN)
+    return
+  end
+
+  -- Create a new terminal buffer
+  local term_buf = vim.api.nvim_create_buf(false, true)
+
+  -- Set buffer options
+  vim.api.nvim_buf_set_option(term_buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(term_buf, "buflisted", false)
+  vim.api.nvim_buf_set_option(term_buf, "swapfile", false)
+
+  -- Split current window and show terminal
+  vim.cmd("split")
+  local term_win = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(term_win, term_buf)
+
+  -- Set window title
+  vim.api.nvim_win_set_option(term_win, "statusline", string.format("Process %s Log (tail -f)", pid))
+
+  -- Start tail command in terminal
+  local job_id = vim.fn.termopen(string.format('tail -f "%s"', log_file), {
+    on_exit = function()
+      -- Close terminal window when tail exits
+      if vim.api.nvim_win_is_valid(term_win) then
+        vim.api.nvim_win_close(term_win, true)
+      end
+    end,
+  })
+
+  -- Set up keybindings for terminal buffer
+  local function close_terminal()
+    if vim.api.nvim_win_is_valid(term_win) then
+      vim.api.nvim_win_close(term_win, true)
+    end
+  end
+
+  -- Map 'q' and '<C-c>' to close terminal
+  vim.api.nvim_buf_set_keymap(term_buf, "t", "q", "", {
+    callback = close_terminal,
+    noremap = true,
+    silent = true,
+  })
+
+  vim.api.nvim_buf_set_keymap(term_buf, "t", "<C-c>", "", {
+    callback = close_terminal,
+    noremap = true,
+    silent = true,
+  })
+
+  -- Also map in normal mode for when terminal is not active
+  vim.api.nvim_buf_set_keymap(term_buf, "n", "q", "", {
+    callback = close_terminal,
+    noremap = true,
+    silent = true,
+  })
+
+  log(string.format("Opened log viewer for process %s", tostring(pid)))
+end
+
 function M.setup(opts)
   opts = opts or {}
-  
+
   -- Merge configuration
   config = vim.tbl_deep_extend("force", default_config, opts)
-  
+
   -- Validate configuration
   if type(config.custom_instructions) ~= "string" then
     error("planner.nvim: custom_instructions must be a string")
   end
-  
+
   if type(config.log_path) ~= "string" or config.log_path == "" then
     error("planner.nvim: log_path must be a non-empty string")
   end
-  
+
   if type(config.response_path) ~= "string" or config.response_path == "" then
     error("planner.nvim: response_path must be a non-empty string")
   end
@@ -551,12 +647,12 @@ function M.setup(opts)
   -- Create directory structure for configurable paths
   local log_dir = vim.fn.fnamemodify(config.log_path, ":h")
   local response_dir = vim.fn.fnamemodify(config.response_path, ":h")
-  
+
   local success = vim.fn.mkdir(log_dir, "p")
   if success == 0 then
     error("planner.nvim: Failed to create log directory: " .. log_dir)
   end
-  
+
   success = vim.fn.mkdir(response_dir, "p")
   if success == 0 then
     error("planner.nvim: Failed to create response directory: " .. response_dir)
@@ -568,10 +664,17 @@ function M.setup(opts)
     noremap = true,
     silent = true,
   })
-  
+
   -- Set up abort key mapping
   vim.keymap.set("n", "<leader>pa", M.abort_process, {
     desc = "Abort planner process at cursor",
+    noremap = true,
+    silent = true,
+  })
+
+  -- Set up log viewing key mapping
+  vim.keymap.set("n", "<leader>pl", M.show_process_log, {
+    desc = "Show planner process log at cursor",
     noremap = true,
     silent = true,
   })
