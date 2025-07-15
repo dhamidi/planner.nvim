@@ -52,62 +52,7 @@ If selected_text contains the word "study", actually perform the research and in
   return prompt
 end
 
--- Filter unwanted characters from output
-local function filter_output_characters(text)
-  -- Remove box drawing characters one by one to avoid pattern issues
-  local filtered = text
-  
-  -- Remove ANSI escape sequences (ESC[ followed by parameters and command)
-  filtered = filtered:gsub("\027%[[0-9;]*[mK]", "")
-  filtered = filtered:gsub("\033%[[0-9;]*[mK]", "")
-  
-  -- Remove other common ANSI escape sequences
-  filtered = filtered:gsub("\027%[[0-9;]*[A-Za-z]", "")
-  filtered = filtered:gsub("\033%[[0-9;]*[A-Za-z]", "")
-  
-  -- Horizontal box drawing characters
-  filtered = filtered:gsub("[─━┄┅┈┉╌╍═]", "")
-  
-  -- Vertical box drawing characters  
-  filtered = filtered:gsub("[│┃┆┇┊┋╎╏║]", "")
-  
-  -- Box drawing corners and junctions
-  filtered = filtered:gsub("[┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿]", "")
-  
-  -- Additional box drawing characters
-  filtered = filtered:gsub("[╀╁╂╃╄╅╆╇╈╉╊╋╌╍╎╏═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬]", "")
-  
-  -- Remove control characters except tab and newline
-  filtered = filtered:gsub("[\1-\8\11-\12\14-\31\127]", "")
-  
-  -- Remove null bytes
-  filtered = filtered:gsub("\0", "")
-  
-  return filtered
-end
 
--- Generate preview text from stdout data
-local function generate_preview(data)
-  -- Apply character filtering
-  local cleaned = filter_output_characters(data)
-  
-  -- Split into lines and remove empty lines
-  local lines = {}
-  for line in cleaned:gmatch("[^\r\n]+") do
-    local trimmed = line:gsub("^%s*(.-)%s*$", "%1")
-    if trimmed ~= "" then
-      table.insert(lines, trimmed)
-    end
-  end
-  
-  -- Join lines with spaces and get last 40 characters
-  local text = table.concat(lines, " ")
-  if #text > 40 then
-    return string.sub(text, -40)
-  else
-    return text
-  end
-end
 
 -- Logging function
 local function log(msg)
@@ -192,11 +137,8 @@ local function update_virtual_text(pid)
   -- Format elapsed time
   local time_str = string.format("%.1fs", elapsed)
   
-  -- Build display text with spinner, time, and output preview
+  -- Build display text with just spinner, time, and processing text
   local display_text = string.format(" %s Processing (%s)", spinner, time_str)
-  if process_info.last_output and process_info.last_output ~= "" then
-    display_text = display_text .. " " .. process_info.last_output
-  end
   
   -- Get current extmark position
   local extmark_pos = vim.api.nvim_buf_get_extmark_by_id(
@@ -398,7 +340,6 @@ function M.process_selected_text()
     orig_hash = vim.fn.sha256(selected_text),
     response_file = response_file,
     selected_text = selected_text,
-    last_output = "",
     spinner_index = 1,  -- per-process spinner state
   }
 
@@ -509,23 +450,13 @@ function M.process_selected_text()
     end
   end)
 
-  -- Start reading stdout
+  -- Start reading stdout (but don't process it for display)
   stdout_pipe:read_start(function(err, data)
     if err then
       log("Error reading stdout: " .. err)
     elseif data then
-      vim.schedule(function()
-        local process_info = active_processes[pid]
-        if process_info then
-          process_info.last_output = generate_preview(data)
-          
-          log(string.format("Stdout data: '%s'", data))
-          log(string.format("Last output: '%s'", process_info.last_output))
-          
-          -- Update virtual text immediately
-          update_virtual_text(pid)
-        end
-      end)
+      -- Just log the data, don't update virtual text
+      log(string.format("Stdout data: '%s'", data))
     end
   end)
 
