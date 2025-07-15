@@ -178,8 +178,138 @@ While the LLM is working, an auto updating placeholder is inserted in the locati
    d. Verify custom instructions appear in LLM prompts correctly
    e. Test file operations use configured paths properly
 
+### Improvement: better output filtering
+
+1. **Implement immediate output display on stdout data arrival**
+   a. Add callback function to `stdout:read_start()` that triggers virtual text update
+   b. Store reference to current extmark ID in process tracking table
+   c. Call `update_virtual_text()` immediately when new data arrives in stdout callback
+   d. Ensure virtual text updates don't conflict with existing timer-based updates
+   e. Debounce rapid updates to prevent excessive re-rendering
+
+2. **Remove ellipsis display logic**
+   a. Locate current ellipsis addition code (likely in output truncation logic)
+   b. Remove `"..."` concatenation from output formatting function
+   c. Update character limit handling to simply truncate without ellipsis indicator
+   d. Ensure truncated output still looks clean without ellipsis suffix
+
+3. **Create character filtering function for output cleanup**
+   a. Implement `filter_output_characters(text)` function
+   b. Define Unicode ranges for box drawing characters (U+2500-U+257F)
+   c. Define Unicode ranges for line drawing characters (U+2580-U+259F)
+   d. Create pattern to match non-printable characters (control chars, null bytes)
+   e. Use `string.gsub()` with Unicode patterns to remove unwanted characters
+
+4. **Implement box drawing character removal**
+   a. Create pattern for horizontal box chars: `[─━┄┅┈┉╌╍═╤╥╦╧╨╩╪╫╬]`
+   b. Create pattern for vertical box chars: `[│┃┆┇┊┋╎╏║╟╢╣╠╡╞╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣]`
+   c. Create pattern for corner box chars: `[┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿╀╁╂╃╄╅╆╇╈╉╊╋]`
+   d. Combine all patterns and remove matching characters with `string.gsub(text, pattern, "")`
+
+5. **Filter non-printable characters**
+   a. Remove control characters (ASCII 0-31 except newline/tab): `string.gsub(text, "[%c]", "")`
+   b. Remove null bytes and other problematic characters: `string.gsub(text, "[%z]", "")`
+   c. Handle UTF-8 non-printable characters using Unicode categories
+   d. Preserve essential whitespace (spaces, tabs) while removing other control chars
+
+6. **Update output processing pipeline**
+   a. Modify stdout callback to apply character filtering before storage
+   b. Call `filter_output_characters()` on each received chunk
+   c. Update last 20 characters extraction to work with filtered output
+   d. Ensure filtering doesn't break UTF-8 character boundaries
+
+7. **Integrate filtering with existing virtual text display**
+   a. Apply character filtering in `update_virtual_text()` function
+   b. Ensure filtered output length calculation is accurate
+   c. Test that filtered output displays correctly in virtual text
+   d. Handle edge cases where filtering removes all characters
+
+8. **Test output filtering functionality**
+   a. Test with output containing box drawing characters (progress bars, tables)
+   b. Test with control characters and escape sequences
+   c. Verify immediate display works without waiting for timer
+   d. Ensure filtering doesn't break legitimate characters or UTF-8 sequences
+   e. Test performance with high-volume output streams
+
 ### Extract operation: Research
 
 The research operation takes the selected text in the context of the given plan and performs detailed technical research: identifying which files will need to change and summarizing the change that needs to be performed in each file.
 
 It should be available under `<leader> p r`
+
+1. **Create research-specific prompt function**
+   a. Create `prepare_research_prompt(file_contents, selected_text)` function
+   b. Customize prompt to focus on technical research and file analysis
+   c. Include instructions for LLM to analyze selected text within plan context
+   d. Request specific output format: list of files with change descriptions
+   e. Add directive to perform actual research rather than just breaking down steps
+
+2. **Implement research operation function**
+   a. Create `M.process_research()` function following pattern of `M.process_selected_text()`
+   b. Use same visual selection handling logic (lines 90-147 from main function)
+   c. Get selected text and file contents using existing extraction methods
+   d. Call `prepare_research_prompt()` instead of `prepare_llm_prompt()`
+   e. Use same process spawning and management system as main function
+
+3. **Add research keymap registration**
+   a. Add keymap setup in `M.setup()` function after existing keymaps
+   b. Use `vim.keymap.set("v", "<leader>pr", M.process_research, {...})`
+   c. Set appropriate description: "Research selected text for implementation"
+   d. Use same options: `noremap = true, silent = true`
+
+4. **Customize research prompt engineering**
+   a. Prompt should instruct LLM to analyze the selected text within the full plan context
+   b. Focus on identifying specific files that need changes
+   c. For each file, describe the nature of changes needed
+   d. Include any API research, library documentation, or technical details
+   e. Request concrete implementation guidance rather than high-level planning
+
+5. **Handle research-specific output formatting**
+   a. Consider different output format than regular planning operation
+   b. May need structured output like:
+
+      ```
+      ## Files to modify:
+      
+      ### lua/planner/init.lua
+      - Add new function for research operation
+      - Modify setup function to register keymap
+      
+      ### README.md
+      - Document new research operation
+      ```
+
+   c. Use same text replacement mechanism as main operation
+   d. Ensure output fits naturally into markdown plan structure
+
+6. **Research operation prompt template**
+   a. Create specialized prompt that emphasizes technical research
+   b. Include instructions to actually look up technical details
+   c. Request file-by-file implementation analysis
+   d. Sample prompt structure:
+
+      ```
+      You are a technical research assistant for code implementation planning.
+      
+      Analyze the selected text within the context of the full plan and perform detailed technical research.
+      
+      For the selected planning step, identify:
+      1. Which specific files will need to be modified
+      2. What changes are needed in each file
+      3. Any APIs, libraries, or technical details to research
+      4. Concrete implementation guidance
+      
+      Research actual technical details and include findings in your response.
+      ```
+
+7. **Add research operation to plugin exports**
+   a. Ensure `M.process_research` is accessible from the module
+   b. Test that keymap correctly triggers the research function
+   c. Verify research operation works with existing process management (timers, virtual text, abort)
+
+8. **Test research operation functionality**
+   a. Test visual selection handling works correctly for research
+   b. Verify research prompts generate appropriate technical analysis
+   c. Test process management features work (spinner, abort, output preview)
+   d. Ensure research output integrates well with existing plan structure
+   e. Test with different types of selected text (high-level vs detailed steps)

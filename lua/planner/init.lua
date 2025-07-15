@@ -52,10 +52,44 @@ If selected_text contains the word "study", actually perform the research and in
   return prompt
 end
 
+-- Filter unwanted characters from output
+local function filter_output_characters(text)
+  -- Remove box drawing characters one by one to avoid pattern issues
+  local filtered = text
+  
+  -- Remove ANSI escape sequences (ESC[ followed by parameters and command)
+  filtered = filtered:gsub("\027%[[0-9;]*[mK]", "")
+  filtered = filtered:gsub("\033%[[0-9;]*[mK]", "")
+  
+  -- Remove other common ANSI escape sequences
+  filtered = filtered:gsub("\027%[[0-9;]*[A-Za-z]", "")
+  filtered = filtered:gsub("\033%[[0-9;]*[A-Za-z]", "")
+  
+  -- Horizontal box drawing characters
+  filtered = filtered:gsub("[─━┄┅┈┉╌╍═]", "")
+  
+  -- Vertical box drawing characters  
+  filtered = filtered:gsub("[│┃┆┇┊┋╎╏║]", "")
+  
+  -- Box drawing corners and junctions
+  filtered = filtered:gsub("[┌┍┎┏┐┑┒┓└┕┖┗┘┙┚┛├┝┞┟┠┡┢┣┤┥┦┧┨┩┪┫┬┭┮┯┰┱┲┳┴┵┶┷┸┹┺┻┼┽┾┿]", "")
+  
+  -- Additional box drawing characters
+  filtered = filtered:gsub("[╀╁╂╃╄╅╆╇╈╉╊╋╌╍╎╏═║╒╓╔╕╖╗╘╙╚╛╜╝╞╟╠╡╢╣╤╥╦╧╨╩╪╫╬]", "")
+  
+  -- Remove control characters except tab and newline
+  filtered = filtered:gsub("[\1-\8\11-\12\14-\31\127]", "")
+  
+  -- Remove null bytes
+  filtered = filtered:gsub("\0", "")
+  
+  return filtered
+end
+
 -- Generate preview text from stdout data
 local function generate_preview(data)
-  -- Remove common box drawing characters (Lua doesn't support unicode ranges well)
-  local cleaned = data:gsub("[─│┌┐└┘├┤┬┴┼║═╔╗╚╝╠╣╦╩╬]", "")
+  -- Apply character filtering
+  local cleaned = filter_output_characters(data)
   
   -- Split into lines and remove empty lines
   local lines = {}
@@ -66,10 +100,10 @@ local function generate_preview(data)
     end
   end
   
-  -- Join lines with spaces and get last 20 characters
+  -- Join lines with spaces and get last 40 characters
   local text = table.concat(lines, " ")
-  if #text > 20 then
-    return string.sub(text, -20)
+  if #text > 40 then
+    return string.sub(text, -40)
   else
     return text
   end
@@ -142,6 +176,46 @@ local function setup_buffer_lock(bufnr)
       end
     end
   })
+end
+
+-- Update virtual text for a specific process
+local function update_virtual_text(pid)
+  local process_info = active_processes[pid]
+  if not process_info then return end
+  
+  local elapsed = (vim.loop.hrtime() - process_info.start_time) / 1e9
+  
+  -- Update spinner animation per process
+  process_info.spinner_index = (process_info.spinner_index % #spinner_frames) + 1
+  local spinner = spinner_frames[process_info.spinner_index]
+  
+  -- Format elapsed time
+  local time_str = string.format("%.1fs", elapsed)
+  
+  -- Build display text with spinner, time, and output preview
+  local display_text = string.format(" %s Processing (%s)", spinner, time_str)
+  if process_info.last_output and process_info.last_output ~= "" then
+    display_text = display_text .. " " .. process_info.last_output
+  end
+  
+  -- Get current extmark position
+  local extmark_pos = vim.api.nvim_buf_get_extmark_by_id(
+    process_info.bufnr, namespace, process_info.end_extmark_id, {}
+  )
+  
+  -- Update the extmark with new virtual text
+  if extmark_pos and #extmark_pos >= 2 then
+    local end_row, end_col = extmark_pos[1], extmark_pos[2]
+    if end_col >= 0 then
+      vim.api.nvim_buf_set_extmark(process_info.bufnr, namespace, end_row, end_col, {
+        id = process_info.end_extmark_id,
+        virt_text = {{display_text, "Comment"}},
+        virt_text_pos = "eol",
+        hl_group = 'ErrorMsg',
+        priority = 200
+      })
+    end
+  end
 end
 
 -- Clean up process resources
@@ -447,6 +521,9 @@ function M.process_selected_text()
           
           log(string.format("Stdout data: '%s'", data))
           log(string.format("Last output: '%s'", process_info.last_output))
+          
+          -- Update virtual text immediately
+          update_virtual_text(pid)
         end
       end)
     end
@@ -470,59 +547,15 @@ function M.process_selected_text()
 
   -- Start timer to update spinner and counter
   active_processes[pid].timer:start(
-    500,
-    500,
+    100,
+    100,
     vim.schedule_wrap(function()
-      local process_info = active_processes[pid]
-      if not process_info then
+      if not active_processes[pid] then
         return
       end
-
-      local elapsed = (vim.loop.hrtime() - process_info.start_time) / 1e9
       
-      -- Update spinner animation per process
-      process_info.spinner_index = (process_info.spinner_index % #spinner_frames) + 1
-      local spinner = spinner_frames[process_info.spinner_index]
-      
-      -- Format elapsed time
-      local time_str = string.format("%.1fs", elapsed)
-      
-      -- Build display text with spinner, time, and output preview
-      local display_text = string.format(" %s Processing (%s)", spinner, time_str)
-      if process_info.last_output and process_info.last_output ~= "" then
-        -- Add ellipsis if the preview was truncated (20 chars is the max from generate_preview)
-        local preview = process_info.last_output
-        if #preview == 20 then
-          preview = "..." .. preview
-        end
-        display_text = display_text .. " " .. preview
-      end
-      
-      -- Get current extmark position
-      local extmark_pos = vim.api.nvim_buf_get_extmark_by_id(
-        process_info.bufnr, namespace, process_info.end_extmark_id, {}
-      )
-      
-      -- Update the extmark with new virtual text (don't reposition)
-      if extmark_pos and #extmark_pos >= 2 then
-        local end_row, end_col = extmark_pos[1], extmark_pos[2]
-        if end_col >= 0 then
-          -- Update only the virtual text properties, let extmark keep its position
-          vim.api.nvim_buf_set_extmark(process_info.bufnr, namespace, end_row, end_col, {
-            id = process_info.end_extmark_id,
-            virt_text = {{display_text, "Comment"}},
-            virt_text_pos = "eol",
-            hl_group = 'ErrorMsg',
-            priority = 200
-          })
-        else
-          -- Fallback for invalid column - just log it
-          log(string.format("Invalid column for extmark update: row=%d, col=%d", end_row, end_col))
-        end
-      else
-        -- Extmark no longer exists
-        log(string.format("Extmark %d no longer exists for PID %s", process_info.end_extmark_id, tostring(pid)))
-      end
+      -- Use the centralized update function
+      update_virtual_text(pid)
     end)
   )
 end
